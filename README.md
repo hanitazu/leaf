@@ -39,7 +39,11 @@ Die meisten Browser schleppen Shopping-Assistenten, Sync, News-Feeds und Dutzend
 | `Strg+Umschalt+J` | Downloads |
 | `F5` / `F11` | Neu laden / Vollbild |
 
-## Installieren
+## Download
+
+Die fertige `leaf.exe` gibt es unter **[Releases](https://github.com/hanitazu/leaf/releases/latest)** – herunterladen, starten, fertig.
+
+## Selbst bauen
 
 Voraussetzungen: Windows 10/11 (WebView2 ist vorinstalliert), [Rust](https://rustup.rs) und die Visual Studio Build Tools (C++).
 
