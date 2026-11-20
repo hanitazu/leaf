@@ -65,7 +65,7 @@ Alle Daten (Verlauf, Favoriten, Sitzung) bleiben lokal unter `%LOCALAPPDATA%\Lea
 
 ## Über das Projekt
 
-Leaf ist mein eigenes Projekt – Idee, Design und Richtung kommen von mir. Beim Programmieren habe ich mir von KI helfen lassen.
+Leaf ist mein eigenes Projekt – Idee, Design und Richtung kommen von mir. Bei Fehlerbehebung, Optimierung und der Umsetzung hat mir KI geholfen.
 
 ## Lizenz
 
