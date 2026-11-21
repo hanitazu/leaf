@@ -1,5 +1,23 @@
 # Update-Log
 
+## 1.1.1
+
+### Behoben
+- **Login-Popups blieben nach dem Schließen von Leaf offen** und hielten die Web-Engine im Hintergrund am Laufen – sie werden jetzt mit Leaf geschlossen.
+- **Steam-/App-Links ersetzten die Seite durch die Fehlerseite** (z. B. „Server beitreten“ auf xplay.gg) – die Seite bleibt jetzt stehen, Steam startet.
+- **Geblockte Werbe-Skripte** (Google Ads, AdSense, Analytics, Tag Manager) werden durch harmlose Attrappen ersetzt statt mit einem Fehler abgebrochen – so warten Seiten nicht auf Timeouts und Links mit Tracking funktionieren weiter.
+- Seiten ohne normale Adresse (z. B. `data:`) wurden fälschlich als leerer Tab behandelt.
+
+### Korrektur zu 1.1.0
+Die Aussage „Seiten laden schneller“ war zu optimistisch: Nachgemessen (Spiegel, Chip, GitHub, Wikipedia, je dreimal mit leerem Cache) laden einzelne Seiten **nicht messbar schneller** als vorher. Spürbar schneller ist der Alltag trotzdem, weil Tabs beim Zurückwechseln nicht mehr neu laden.
+
+### Geprüft
+- YouTube läuft im Hintergrund-Tab weiter (35 s beobachtet, echtes YouTube-Video)
+- YouTube-Werbedaten werden auf echten YouTube-Seiten entfernt
+- Login-Popup → eigenes Fenster, `target=_blank` → Tab, ungefragtes Popup → geblockt
+- `steam://connect/…` wird an Steam übergeben, die Seite bleibt stehen
+- Absturz der Web-Engine → Leaf startet sich mit allen Tabs neu
+
 ## 1.1.0
 
 ### Neu
@@ -19,7 +37,7 @@
 - **Manche Seiten zeigten die Fehlerseite** – Leaf zeigt sie nur noch bei echten Verbindungsfehlern. Antwortet der Server (auch mit 403/404), erscheint dessen Seite.
 - **Downloads wurden nicht angezeigt** – ein Klick auf einen Download-Link ersetzte die Seite durch die Fehlerseite. Jetzt startet der Download sichtbar und die Seite bleibt stehen.
 - **Zufällige Abstürze** – eine Absturzquelle beim Tab-Wechsel beseitigt. Stürzt die Web-Engine selbst ab, startet Leaf sich mit allen Tabs neu. Seiten-Abstürze laden den Tab neu.
-- **Seiten laden schneller** – der Werbeblocker prüft nur noch Anfragen an Werbeserver, statt jede Anfrage über Leaf zu leiten. Prozess-Limits entfernt, die Seiten ausbremsten.
+- **Weniger Last** – der Werbeblocker prüft nur noch Anfragen an Werbeserver, statt jede Anfrage über Leaf zu leiten; Prozess-Limit entfernt (siehe Korrektur in 1.1.1).
 
 ## 1.0.0
 

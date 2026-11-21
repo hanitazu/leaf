@@ -5,13 +5,14 @@ use crate::UserEvent;
 use std::sync::atomic::Ordering;
 use tao::event_loop::EventLoopProxy;
 use webview2_com::{
-    take_pwstr, BytesReceivedChangedEventHandler, ClearBrowsingDataCompletedHandler,
-    ContainsFullScreenElementChangedEventHandler, DownloadStartingEventHandler,
-    FaviconChangedEventHandler, GetCookiesCompletedHandler, HistoryChangedEventHandler,
-    IsDocumentPlayingAudioChangedEventHandler, LaunchingExternalUriSchemeEventHandler,
-    Microsoft::Web::WebView2::Win32::*, NavigationCompletedEventHandler,
-    NewWindowRequestedEventHandler, ProcessFailedEventHandler, StateChangedEventHandler,
-    TrySuspendCompletedHandler, WebResourceRequestedEventHandler, ZoomFactorChangedEventHandler,
+    take_pwstr, BytesReceivedChangedEventHandler, CallDevToolsProtocolMethodCompletedHandler,
+    ClearBrowsingDataCompletedHandler, ContainsFullScreenElementChangedEventHandler,
+    DownloadStartingEventHandler, FaviconChangedEventHandler, GetCookiesCompletedHandler,
+    HistoryChangedEventHandler, IsDocumentPlayingAudioChangedEventHandler,
+    LaunchingExternalUriSchemeEventHandler, Microsoft::Web::WebView2::Win32::*,
+    NavigationCompletedEventHandler, NewWindowRequestedEventHandler, ProcessFailedEventHandler,
+    StateChangedEventHandler, TrySuspendCompletedHandler, WebResourceRequestedEventHandler,
+    ZoomFactorChangedEventHandler,
 };
 use windows::{
     core::{w, Interface, PWSTR},
@@ -101,7 +102,7 @@ pub fn attach(view: &WebView, proxy: EventLoopProxy<UserEvent>, id: u32) {
         if let Ok(env) = wv.cast::<ICoreWebView2_2>().and_then(|w| w.Environment()) {
             let p = proxy.clone();
             // Nur Anfragen an bekannte Werbe-Hosts werden gemeldet; alles andere lädt
-            // ohne Umweg über Leaf (früher lief jede Anfrage durch den UI-Thread).
+            // ohne Umweg über Leafs UI-Thread.
             let started = std::time::Instant::now();
             let mut any = false;
             for f in crate::adblock::filters() {
@@ -119,9 +120,26 @@ pub fn attach(view: &WebView, proxy: EventLoopProxy<UserEvent>, id: u32) {
                         let Some(args) = args else { return Ok(()) };
                         let mut uri = PWSTR::null();
                         args.Request()?.Uri(&mut uri)?;
-                        if crate::adblock::is_blocked(&take_pwstr(uri)) {
-                            let resp =
-                                env.CreateWebResourceResponse(None, 403, w!("Blocked"), w!(""))?;
+                        let uri = take_pwstr(uri);
+                        if crate::adblock::is_blocked(&uri) {
+                            crate::debug_log(&format!("geblockt: {uri}"));
+                            let mut ctx = COREWEBVIEW2_WEB_RESOURCE_CONTEXT::default();
+                            let _ = args.ResourceContext(&mut ctx);
+                            let resp = if ctx == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_SCRIPT {
+                                // Skript „lädt“ als Attrappe → die Seite wartet nicht auf einen Timeout
+                                let body = crate::adblock::script_stub(&uri);
+                                let stream = windows::Win32::UI::Shell::SHCreateMemStream(Some(
+                                    body.as_bytes(),
+                                ));
+                                env.CreateWebResourceResponse(
+                                    stream.as_ref(),
+                                    200,
+                                    w!("OK"),
+                                    w!("Content-Type: application/javascript"),
+                                )?
+                            } else {
+                                env.CreateWebResourceResponse(None, 403, w!("Blocked"), w!(""))?
+                            };
                             args.SetResponse(&resp)?;
                             let _ = p.send_event(UserEvent::Blocked(id));
                         }
@@ -234,6 +252,7 @@ pub fn attach(view: &WebView, proxy: EventLoopProxy<UserEvent>, id: u32) {
                 let mut user = BOOL::default();
                 args.IsUserInitiated(&mut user)?;
                 if !user.as_bool() && crate::adblock::enabled() {
+                    crate::debug_log("neues fenster: ungefragt -> geblockt");
                     return args.SetHandled(true);
                 }
                 let mut sized = BOOL::default();
@@ -241,10 +260,12 @@ pub fn attach(view: &WebView, proxy: EventLoopProxy<UserEvent>, id: u32) {
                     let _ = f.HasSize(&mut sized);
                 }
                 if sized.as_bool() {
+                    crate::debug_log("neues fenster: popup-fenster");
                     return Ok(()); // WebView2 öffnet ein Popup-Fenster mit Opener
                 }
                 let mut uri = PWSTR::null();
                 args.Uri(&mut uri)?;
+                crate::debug_log("neues fenster: als tab");
                 args.SetHandled(true)?;
                 let _ = p.send_event(UserEvent::NewTab(take_pwstr(uri)));
                 Ok(())
@@ -321,15 +342,26 @@ pub fn attach(view: &WebView, proxy: EventLoopProxy<UserEvent>, id: u32) {
         // Externe Apps: steam://, discord:// usw. direkt öffnen (z. B. CS2-Server über
         // xplay.gg beitreten, Spiele starten). Andere Schemata fragen wie gewohnt nach.
         if let Ok(w18) = wv.cast::<ICoreWebView2_18>() {
+            let p = proxy.clone();
             let _ = w18.add_LaunchingExternalUriScheme(
                 &LaunchingExternalUriSchemeEventHandler::create(Box::new(move |_, args| {
                     let Some(args) = args else { return Ok(()) };
                     let mut uri = PWSTR::null();
                     args.Uri(&mut uri)?;
                     let uri = take_pwstr(uri);
-                    if trusted_app_scheme(&uri) {
+                    let ok = trusted_app_scheme(&uri);
+                    crate::debug_log(&format!(
+                        "externe app: {uri} -> {}",
+                        if ok { "geöffnet" } else { "nachfragen" }
+                    ));
+                    // Die Seite bleibt stehen – die abgebrochene Navigation ist kein Fehler
+                    let _ = p.send_event(UserEvent::External(id));
+                    if ok {
                         args.SetCancel(true)?;
-                        open_external(&uri);
+                        // Testmodus mit LEAF_NO_LAUNCH: nicht wirklich starten
+                        if std::env::var_os("LEAF_NO_LAUNCH").is_none() {
+                            open_external(&uri);
+                        }
                     }
                     Ok(())
                 })),
@@ -427,6 +459,50 @@ mod tests {
         assert!(!super::trusted_app_scheme("ms-msdt:/id PCWDiagnostic"));
         assert!(!super::trusted_app_scheme("search-ms:query=x"));
         assert!(!super::trusted_app_scheme("file:///C:/x.exe"));
+    }
+}
+
+/// Popup-Fenster (Logins usw.) gehören der Web-Engine, nicht Leaf. Beim Beenden
+/// schließen wir sie ordentlich – sonst würden sie Leaf überleben.
+pub fn close_popups(view: &WebView) {
+    use windows::Win32::{
+        Foundation::{LPARAM, WPARAM},
+        UI::WindowsAndMessaging::{
+            EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE,
+        },
+    };
+    let Some(wv) = core(view) else { return };
+    let mut pid = 0u32;
+    unsafe {
+        if wv.BrowserProcessId(&mut pid).is_err() || pid == 0 {
+            return;
+        }
+        unsafe extern "system" fn each(h: HWND, lp: LPARAM) -> BOOL {
+            let mut owner = 0u32;
+            GetWindowThreadProcessId(h, Some(&mut owner));
+            if owner == lp.0 as u32 && IsWindowVisible(h).as_bool() {
+                let _ = PostMessageW(h, WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            BOOL(1)
+        }
+        let _ = EnumWindows(Some(each), LPARAM(pid as isize));
+    }
+}
+
+/// Nur für Tests (LEAF_DEBUG): echter Mausklick über das DevTools-Protokoll –
+/// zählt als Nutzerklick, braucht aber keinen Fensterfokus.
+pub fn debug_click(view: &WebView, x: i32, y: i32) {
+    let Some(wv) = core(view) else { return };
+    for kind in ["mousePressed", "mouseReleased"] {
+        let params =
+            format!(r#"{{"type":"{kind}","x":{x},"y":{y},"button":"left","clickCount":1}}"#);
+        unsafe {
+            let _ = wv.CallDevToolsProtocolMethod(
+                w!("Input.dispatchMouseEvent"),
+                &windows::core::HSTRING::from(params),
+                &CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|_, _| Ok(()))),
+            );
+        }
     }
 }
 

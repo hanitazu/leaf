@@ -84,6 +84,10 @@ pub enum UserEvent {
     Nav(u32),
     NavError(u32, String),
     ShowError(u32, String),
+    /// Tab hat eine externe App gestartet (steam:// …)
+    External(u32),
+    /// nur Testmodus: simulierter Klick (Tab, "x,y")
+    DebugClick(u32, String),
     Favicon(u32, String),
     Open(String),
     CookiesSaved,
@@ -169,8 +173,10 @@ struct Tab {
     /// seit wann im Hintergrund
     hidden_at: Option<Instant>,
     suspended: bool,
-    /// letzter Download aus diesem Tab (dessen Navigation „scheitert“ technisch)
+    /// letzter Download/App-Start aus diesem Tab (dessen Navigation „scheitert“ technisch)
     dl_at: Option<Instant>,
+    /// Start der aktuellen Navigation (für die Ladezeit im Debug-Log)
+    load_start: Option<Instant>,
 }
 
 /// Eigene Fehlerseite im Leaf-Look (statt der Edge-Seite von WebView2).
@@ -227,6 +233,7 @@ impl Tab {
             hidden_at: None,
             suspended: false,
             dl_at: None,
+            load_start: None,
         }
     }
 }
@@ -501,6 +508,7 @@ impl Browser {
     }
 
     fn close_tab(&mut self, id: Option<u32>) -> bool {
+        debug_log(&format!("close_tab {id:?} (tabs: {})", self.tabs.len()));
         let idx = match id {
             Some(id) => match self.tabs.iter().position(|t| t.id == id) {
                 Some(i) => i,
@@ -732,6 +740,7 @@ impl Browser {
 
     /// Alles speichern und Leaf neu starten (nach einem Absturz der Web-Engine).
     fn restart(&mut self) {
+        debug_log("restart");
         self.save_window();
         self.persist();
         self.history.flush();
@@ -794,6 +803,9 @@ impl Browser {
     /// Beenden: Fenster sofort weg, alles speichern, dann Session-Cookies sichern.
     /// true = sofort beenden.
     fn begin_quit(&mut self) -> bool {
+        debug_log("begin_quit");
+        #[cfg(windows)]
+        win::close_popups(&self.toolbar);
         if self.quitting.is_some() {
             return false;
         }
@@ -907,7 +919,10 @@ impl Browser {
             }
             Cmd::Max => self.window.set_maximized(!self.window.is_maximized()),
             Cmd::Min => self.window.set_minimized(true),
-            Cmd::Close => return false,
+            Cmd::Close => {
+                debug_log("cmd close");
+                return false;
+            }
             Cmd::Resize { dir } => {
                 if self.frame() > 0.0 {
                     use ResizeDirection::*;
@@ -1039,6 +1054,10 @@ impl Browser {
                         self.set_color(id, &k[6..]);
                         return true;
                     }
+                    k if k.starts_with("pruned:") => {
+                        debug_log(&format!("tab {id} werbung entfernt: {}", &k[7..]));
+                        return true;
+                    }
                     _ => return true,
                 };
                 return self.run_cmd(cmd);
@@ -1059,6 +1078,14 @@ impl Browser {
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
                     t.loading = started;
                     if started {
+                        t.load_start = Some(Instant::now());
+                    } else if let Some(s) = t.load_start.take() {
+                        debug_log(&format!(
+                            "tab {id} geladen in {} ms: {url}",
+                            s.elapsed().as_millis()
+                        ));
+                    }
+                    if started {
                         t.blocked = 0;
                         if url != "about:blank" {
                             t.error = false;
@@ -1078,8 +1105,39 @@ impl Browser {
                     if let Some(i) = self.tabs.iter().position(|t| t.id == id) {
                         self.apply_zoom(i);
                     }
+                    // Testmodus: einmal einen echten Klick an LEAF_CLICK="x,y" auslösen
+                    if std::env::var_os("LEAF_DEBUG").is_some() {
+                        if let Ok(xy) = std::env::var("LEAF_CLICK") {
+                            static DONE: AtomicBool = AtomicBool::new(false);
+                            if !DONE.swap(true, Ordering::Relaxed) {
+                                let p = self.proxy.clone();
+                                std::thread::spawn(move || {
+                                    std::thread::sleep(Duration::from_millis(1500));
+                                    let _ = p.send_event(UserEvent::DebugClick(id, xy));
+                                });
+                            }
+                        }
+                    }
                 }
                 self.sync();
+            }
+            UserEvent::DebugClick(id, xy) => {
+                #[cfg(windows)]
+                if let (Some(v), Some((x, y))) = (
+                    self.tabs
+                        .iter()
+                        .find(|t| t.id == id)
+                        .and_then(|t| t.view.as_ref()),
+                    xy.split_once(','),
+                ) {
+                    debug_log(&format!("tab {id} klick bei {x},{y}"));
+                    win::debug_click(
+                        v,
+                        x.trim().parse().unwrap_or(0),
+                        y.trim().parse().unwrap_or(0),
+                    );
+                }
+                let _ = (id, xy);
             }
             UserEvent::Blocked(id) => {
                 let mut redraw = false;
@@ -1199,6 +1257,7 @@ impl Browser {
                 }
             }
             UserEvent::Crashed(id, browser) => {
+                debug_log(&format!("crashed tab {id} browser={browser}"));
                 if browser {
                     // Ganze Engine weg (alle Tabs + Leiste) → sauber neu starten;
                     // die Sitzung ist gespeichert, Tabs kommen sofort zurück.
@@ -1219,6 +1278,11 @@ impl Browser {
                 self.sync();
             }
             UserEvent::CookiesSaved => {}
+            UserEvent::External(id) => {
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+                    t.dl_at = Some(Instant::now());
+                }
+            }
             UserEvent::NewTab(url) => self.new_tab(&url),
             UserEvent::Open(url) => {
                 let u = url.trim();
@@ -1327,6 +1391,16 @@ mod tests {
         assert!(!adblock::is_blocked("https://soundcloud.com/discover"));
         assert!(!adblock::is_blocked("https://i1.sndcdn.com/a.jpg"));
         assert!(adblock::filters().len() > 3000);
+        // geblockte Werbe-Skripte bekommen Attrappen statt eines Fehlers
+        assert!(
+            adblock::script_stub("https://securepubads.g.doubleclick.net/tag/js/gpt.js")
+                .contains("googletag")
+        );
+        assert!(
+            adblock::script_stub("https://www.googletagmanager.com/gtag/js?id=G-1")
+                .contains("eventCallback")
+        );
+        assert_eq!(adblock::script_stub("https://ads.example/x.js"), "");
         adblock::set_enabled(false);
         assert!(!adblock::is_blocked("https://doubleclick.net/"));
     }
@@ -1340,6 +1414,15 @@ mod tests {
 }
 
 const RESTART_ARG: &str = "--restart";
+
+/// Port für die Link-Übergabe; ein Testprofil (LEAF_PROFILE) nutzt einen eigenen,
+/// damit es nie mit dem normal laufenden Leaf spricht.
+fn port() -> u16 {
+    match std::env::var("LEAF_PROFILE") {
+        Ok(p) if !p.is_empty() => PORT + 1,
+        _ => PORT,
+    }
+}
 
 /// Host einer URL ohne "www." (für Zoom pro Seite, Tab-Farbe)
 fn host_of(url: &str) -> &str {
@@ -1367,7 +1450,7 @@ static QUITTING: AtomicBool = AtomicBool::new(false);
 /// Läuft Leaf schon? Dann URL an die laufende Instanz übergeben.
 /// Nur wenn sie mit "1" bestätigt, gilt die Übergabe als erledigt.
 fn hand_off(arg: &str) -> bool {
-    let addr = ([127, 0, 0, 1], PORT).into();
+    let addr = ([127, 0, 0, 1], port()).into();
     let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_millis(150)) else {
         return false;
     };
@@ -1380,7 +1463,7 @@ fn hand_off(arg: &str) -> bool {
 }
 
 fn listen(proxy: EventLoopProxy<UserEvent>) {
-    let Ok(l) = TcpListener::bind(("127.0.0.1", PORT)) else {
+    let Ok(l) = TcpListener::bind(("127.0.0.1", port())) else {
         return;
     };
     std::thread::spawn(move || {
@@ -1551,6 +1634,7 @@ fn main() -> wry::Result<()> {
             }
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => {
+                    debug_log("close requested");
                     if b.begin_quit() {
                         *cf = ControlFlow::Exit;
                     }

@@ -22,8 +22,8 @@ pub const PAGE_JS: &str = r#"(function(){if(window.top!==window)return;
 var h=location.hostname,yt=/(^|\.)youtube\.com$/.test(h),sc=/(^|\.)soundcloud\.com$/.test(h);
 if(yt||sc){
  var KEYS=yt?['adPlacements','adSlots','playerAds','adBreakHeartbeatParams']:['audio_ads','ads'];
- var prune=function(o,d){try{if(!o||typeof o!=='object'||d>3)return o;
-  for(var i=0;i<KEYS.length;i++){if(KEYS[i] in o)delete o[KEYS[i]];}
+ var told=0,prune=function(o,d){try{if(!o||typeof o!=='object'||d>3)return o;
+  for(var i=0;i<KEYS.length;i++){if(KEYS[i] in o){delete o[KEYS[i]];if(!told){told=1;try{window.ipc.postMessage('pruned:'+KEYS[i]);}catch(e){}}}}
   if(o.playerResponse)prune(o.playerResponse,d+1);if(o.data)prune(o.data,d+1);
   if(Array.isArray(o))for(var j=0;j<o.length&&j<50;j++)prune(o[j],d+1);}catch(e){}return o;};
  var jp=JSON.parse;JSON.parse=function(){return prune(jp.apply(this,arguments),0);};
@@ -41,6 +41,49 @@ if(yt){
 }
 var s=document.createElement('style');s.textContent=css;
 (document.head||document.documentElement).appendChild(s);})();"#;
+
+/// Geblockte Skripte bekommen eine harmlose Attrappe statt eines Fehlers – sonst
+/// warten manche Seiten auf ihr Werbe-Skript, bis ein Timeout greift (bild.de: +650 ms).
+/// Die Attrappen bilden nur die API nach, laden aber nichts.
+const STUB_GPT: &str = r#"(function(){var p=function(){},s={},slot={};
+['addEventListener','removeEventListener','setTargeting','clearTargeting','set','setPrivacySettings','setRequestNonPersonalizedAds','updateCorrelator','setForceSafeFrame','setLocation','setPublisherProvidedId','setSafeFrameConfig','setVideoContent','enableVideoAds'].forEach(function(k){s[k]=function(){return s;};});
+['getSlots','getTargeting','getTargetingKeys','getAttributeKeys'].forEach(function(k){s[k]=function(){return[];};});
+['refresh','collapseEmptyDivs','disableInitialLoad','enableLazyLoad','setCentering','display','clear','get'].forEach(function(k){s[k]=p;});
+s.enableSingleRequest=function(){return true;};s.isInitialLoadDisabled=function(){return false;};
+['addService','clearCategoryExclusions','clearTargeting','defineSizeMapping','set','setCategoryExclusion','setClickUrl','setCollapseEmptyDiv','setTargeting','setConfig','setForceSafeFrame','setSafeFrameConfig','getSlotId'].forEach(function(k){slot[k]=function(){return slot;};});
+['getAttributeKeys','getCategoryExclusions','getTargeting','getTargetingKeys','getSizes'].forEach(function(k){slot[k]=function(){return[];};});
+['getAdUnitPath','getDomId','getSlotElementId'].forEach(function(k){slot[k]=function(){return'';};});slot.get=p;
+var g=window.googletag||{},q=g.cmd||[];g.apiReady=true;g.pubadsReady=true;
+g.pubads=g.companionAds=g.content=function(){return s;};g.defineSlot=g.defineOutOfPageSlot=function(){return slot;};
+g.sizeMapping=function(){var m={addSize:function(){return m;},build:function(){return[];}};return m;};
+['destroySlots','display','enableServices','setAdIframeTitle','setConfig','disablePublisherConsole','openConsole'].forEach(function(k){g[k]=p;});
+g.getVersion=function(){return'';};g.cmd={push:function(f){try{f();}catch(e){}return 1;}};window.googletag=g;
+if(q&&q.forEach)q.forEach(function(f){try{f();}catch(e){}});})();"#;
+const STUB_ADSENSE: &str = "window.adsbygoogle={loaded:true,push:function(){}};";
+const STUB_GA: &str = r#"(function(){var q=(window.ga&&window.ga.q)||[];
+var ga=function(){var a=arguments,l=a[a.length-1];if(l&&typeof l==='object'&&typeof l.hitCallback==='function'){try{l.hitCallback();}catch(e){}}};
+ga.create=function(){return{get:function(){},set:function(){},send:function(){}};};ga.getByName=function(){return null;};ga.getAll=function(){return[];};ga.loaded=true;
+window.ga=ga;q.forEach(function(x){ga.apply(null,x);});})();"#;
+/// Tag Manager: Links, die auf ein Tracking-„eventCallback“ warten, funktionieren weiter
+const STUB_GTM: &str = r#"(function(){var d=window.dataLayer=window.dataLayer||[];
+var f=function(o){try{if(o&&typeof o.eventCallback==='function')setTimeout(o.eventCallback,1);}catch(e){}};
+d.forEach(f);d.push=function(o){f(o);return Array.prototype.push.apply(d,arguments);};})();"#;
+
+/// Attrappe für ein geblocktes Skript (leer, wenn keine spezielle nötig ist).
+pub fn script_stub(url: &str) -> &'static str {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    if path.ends_with("/gpt.js") || path.ends_with("/pubads_impl.js") {
+        STUB_GPT
+    } else if path.ends_with("/adsbygoogle.js") || path.ends_with("/show_ads.js") {
+        STUB_ADSENSE
+    } else if path.ends_with("/analytics.js") || path.ends_with("/ga.js") {
+        STUB_GA
+    } else if path.ends_with("/gtm.js") || path.contains("/gtag/js") {
+        STUB_GTM
+    } else {
+        ""
+    }
+}
 
 pub fn init(data_dir: &Path, enabled: bool) {
     let mut domains = HashSet::new();
