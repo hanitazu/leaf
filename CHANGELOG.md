@@ -1,5 +1,18 @@
 # Update-Log
 
+## 1.1.2
+
+### Schneller
+- **Neue Tabs öffnen schneller** – Leaf hält im Leerlauf einen unsichtbaren, fertig vorbereiteten Tab bereit. Ein neuer Tab oder ein Tab aus der letzten Sitzung muss dadurch nicht erst erzeugt werden.
+  Gemessen (Link öffnen bis Seite geladen, je 4×): **599 ms statt 641 ms** im Median, alle Werte mit Reserve-Tab schneller als alle ohne. Kostet ca. 15–20 MB RAM.
+
+### Geprüft
+- **YouTube-Werbung, live:** drei beliebte Musikvideos (Despacito, Shape of You, Bohemian Rhapsody) – ohne Blocker lief bei allen dreien Werbung, **mit Blocker bei keinem**, und die Videos spielten normal.
+- **Belastungstest gegen Abstürze:** 2 000 zufällige Aktionen in 2½ Minuten (Tabs öffnen, schließen, wechseln, verschieben, navigieren, zoomen …), dabei rund 580 Tabs erzeugt und wieder zerstört – kein Absturz, kein Hänger, sauber beendet.
+
+### Für Entwickler
+Testhilfen (nur mit `LEAF_DEBUG=1`): eigenes Profil `LEAF_PROFILE`, Belastungstest `LEAF_STRESS=<Anzahl>`, Ereignis-Log mit Zeitstempeln in `debug.log`.
+
 ## 1.1.1
 
 ### Behoben

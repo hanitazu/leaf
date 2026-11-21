@@ -1,6 +1,6 @@
 [package]
 name = "leaf"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2021"
 description = "Leaf - ein schlanker, schneller Browser in Rust"
 

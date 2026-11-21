@@ -462,6 +462,24 @@ mod tests {
     }
 }
 
+/// Nur Testmodus: ein Cookie setzen (z. B. „Cookies ablehnen“ für YouTube).
+pub fn debug_set_cookie(view: &WebView, name: &str, value: &str, domain: &str) {
+    let Some(mgr) = cookie_manager(view) else {
+        return;
+    };
+    unsafe {
+        if let Ok(c) = mgr.CreateCookie(
+            &windows::core::HSTRING::from(name),
+            &windows::core::HSTRING::from(value),
+            &windows::core::HSTRING::from(domain),
+            w!("/"),
+        ) {
+            let _ = c.SetIsSecure(BOOL::from(true));
+            let _ = mgr.AddOrUpdateCookie(&c);
+        }
+    }
+}
+
 /// Popup-Fenster (Logins usw.) gehören der Web-Engine, nicht Leaf. Beim Beenden
 /// schließen wir sie ordentlich – sonst würden sie Leaf überleben.
 pub fn close_popups(view: &WebView) {

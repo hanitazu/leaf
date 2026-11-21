@@ -88,6 +88,10 @@ pub enum UserEvent {
     External(u32),
     /// nur Testmodus: simulierter Klick (Tab, "x,y")
     DebugClick(u32, String),
+    /// Zeit, den Reserve-WebView vorzubereiten
+    MakeSpare,
+    /// nur Testmodus: nächste zufällige Aktion des Belastungstests (Nr.)
+    Stress(u32),
     Favicon(u32, String),
     Open(String),
     CookiesSaved,
@@ -259,6 +263,8 @@ struct Browser {
     wall: u64,
     /// Beenden läuft: Fenster ist weg, Session-Cookies werden noch gesichert
     quitting: Option<Instant>,
+    /// vorgewärmter, unsichtbarer WebView für den nächsten Tab (Nummer, View)
+    spare: Option<(u32, WebView)>,
     ticks: u32,
 }
 
@@ -310,6 +316,12 @@ fn make_tab_view(
     if adblock::enabled() {
         b = b.with_initialization_script(adblock::PAGE_JS);
     }
+    // Testmodus: melden, wenn YouTube gerade Werbung abspielt
+    if std::env::var_os("LEAF_DEBUG").is_some() {
+        b = b.with_initialization_script(
+            r#"(function(){if(window.top!==window||!/youtube.com$/.test(location.hostname))return;var on=false;setInterval(function(){var a=!!document.querySelector('.html5-video-player.ad-showing');if(a!==on){on=a;window.ipc.postMessage('pruned:WERBUNG '+(a?'LAEUFT':'vorbei'));}},250);})();"#,
+        );
+    }
     let b = b
         .with_ipc_handler(move |req: Request<String>| {
             let _ = p1.send_event(UserEvent::Key(id, req.into_body()));
@@ -347,7 +359,9 @@ pub fn debug_log(msg: &str) {
             .append(true)
             .open(data_dir().join("debug.log"))
         {
-            let _ = writeln!(f, "{msg}");
+            static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+            let ms = START.get_or_init(Instant::now).elapsed().as_millis();
+            let _ = writeln!(f, "[{ms:>6}] {msg}");
         }
     }
 }
@@ -449,13 +463,124 @@ impl Browser {
 
     fn create_view(&mut self, idx: usize) {
         let bounds = self.content_rect();
-        let (id, url) = (self.tabs[idx].id, self.tabs[idx].url.clone());
-        match make_tab_view(&self.window, &mut self.ctx, &self.proxy, id, &url, bounds) {
+        let url = self.tabs[idx].url.clone();
+        // Vorgewärmten Reserve-WebView nehmen, wenn einer bereitsteht (spart ~100 ms).
+        // Seine Ereignisse laufen unter der Reserve-Nummer → der Tab übernimmt sie.
+        if let Some((sid, v)) = self.spare.take() {
+            let _ = v.set_bounds(bounds);
+            let _ = v.load_url(&url);
+            debug_log(&format!("tab {sid} reserve-webview genutzt"));
+            let t = &mut self.tabs[idx];
+            t.id = sid;
+            t.view = Some(v);
+            t.loading = true;
+            self.schedule_spare();
+            return;
+        }
+        let id = self.tabs[idx].id;
+        let t0 = Instant::now();
+        let made = make_tab_view(&self.window, &mut self.ctx, &self.proxy, id, &url, bounds);
+        debug_log(&format!(
+            "tab {id} webview erzeugt in {} ms",
+            t0.elapsed().as_millis()
+        ));
+        match made {
             Ok(v) => {
                 self.tabs[idx].view = Some(v);
                 self.tabs[idx].loading = true;
             }
             Err(e) => eprintln!("WebView-Fehler: {e}"),
+        }
+        self.schedule_spare();
+    }
+
+    /// Reserve-WebView kurz nach dem Leerlauf vorbereiten (nicht sofort – das
+    /// würde den gerade ladenden Tab ausbremsen).
+    fn schedule_spare(&self) {
+        if self.spare.is_some() || self.quitting.is_some() {
+            return;
+        }
+        let p = self.proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2500));
+            let _ = p.send_event(UserEvent::MakeSpare);
+        });
+    }
+
+    /// Nur Testmodus: eine zufällige Aktion ausführen, dann die nächste einplanen.
+    /// Schließt nie den letzten Tab (das würde Leaf regulär beenden).
+    fn stress(&mut self, left: u32) -> bool {
+        if left == 0 {
+            debug_log(&format!("stress fertig, {} tabs offen", self.tabs.len()));
+            return true;
+        }
+        static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x9e37_79b9);
+        let r = SEED.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed);
+        let r = (r ^ (r >> 29)).wrapping_mul(0xbf58_476d_1ce4_e5b9) >> 32;
+        const URLS: &[&str] = &[
+            "https://example.com/",
+            "https://de.wikipedia.org/wiki/Blatt",
+            "https://github.com/",
+            "https://www.rust-lang.org/",
+            "https://www.youtube.com/",
+            "https://soundcloud.com/discover",
+            "https://yotube.cioom",
+        ];
+        let n = self.tabs.len().max(1);
+        let pick = |m: usize| (r as usize / 7) % m;
+        let cmd = match r % 14 {
+            0 | 1 => Cmd::NewTab,
+            2 if self.tabs.len() > 1 => Cmd::CloseTab { id: None },
+            3 => Cmd::NextTab,
+            4 => Cmd::PrevTab,
+            5 | 6 => Cmd::Navigate {
+                url: URLS[pick(URLS.len())].into(),
+            },
+            7 => Cmd::Back,
+            8 => Cmd::Reload,
+            9 => Cmd::Zoom {
+                z: 0.5 + pick(16) as f64 / 10.0,
+            },
+            10 => Cmd::TabIndex { i: 1 + pick(9) },
+            11 => Cmd::MoveTab {
+                id: self.tabs[pick(n).min(self.tabs.len() - 1)].id,
+                to: pick(n),
+            },
+            12 => Cmd::Suggest { q: "wi".into() },
+            _ => Cmd::ReopenTab,
+        };
+        if !self.run_cmd(cmd) {
+            debug_log("stress: run_cmd wollte beenden");
+        }
+        if self.tabs.len() > 12 {
+            let _ = self.close_tab(None); // nicht unbegrenzt wachsen
+        }
+        let p = self.proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            let _ = p.send_event(UserEvent::Stress(left - 1));
+        });
+        true
+    }
+
+    fn make_spare(&mut self) {
+        if self.spare.is_some() || self.quitting.is_some() {
+            return;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let bounds = self.content_rect();
+        if let Ok(v) = make_tab_view(
+            &self.window,
+            &mut self.ctx,
+            &self.proxy,
+            id,
+            "about:blank",
+            bounds,
+        ) {
+            let _ = v.set_visible(false);
+            self.spare = Some((id, v));
+            debug_log(&format!("reserve-webview {id} bereit"));
         }
     }
 
@@ -1121,6 +1246,8 @@ impl Browser {
                 }
                 self.sync();
             }
+            UserEvent::MakeSpare => self.make_spare(),
+            UserEvent::Stress(n) => return self.stress(n),
             UserEvent::DebugClick(id, xy) => {
                 #[cfg(windows)]
                 if let (Some(v), Some((x, y))) = (
@@ -1285,6 +1412,7 @@ impl Browser {
             }
             UserEvent::NewTab(url) => self.new_tab(&url),
             UserEvent::Open(url) => {
+                debug_log("link-uebergabe empfangen");
                 let u = url.trim();
                 let empty_open = self.cur().is_some_and(|t| t.url.is_empty());
                 match (u.is_empty(), empty_open) {
@@ -1579,11 +1707,22 @@ fn main() -> wry::Result<()> {
         closed: Vec::new(),
         wall: wall_stamp(),
         quitting: None,
+        spare: None,
         ticks: 0,
     };
     // Session-Cookies vom letzten Mal zurückspielen, bevor ein Tab lädt
     #[cfg(windows)]
     win::restore_session_cookies(&b.toolbar, &b.dir.join("session-cookies.bin"));
+    // Testmodus: LEAF_SET_COOKIE="name|wert|domain"
+    #[cfg(windows)]
+    if std::env::var_os("LEAF_DEBUG").is_some() {
+        if let Ok(c) = std::env::var("LEAF_SET_COOKIE") {
+            let parts: Vec<&str> = c.split('|').collect();
+            if parts.len() == 3 {
+                win::debug_set_cookie(&b.toolbar, parts[0], parts[1], parts[2]);
+            }
+        }
+    }
     b.restyle();
 
     // Sitzung wiederherstellen – Tabs werden erst beim Anklicken geladen.
@@ -1610,6 +1749,16 @@ fn main() -> wry::Result<()> {
     b.window.set_visible(true);
     b.layout(); // Größe erst nach dem Anzeigen endgültig
     b.restyle();
+    b.schedule_spare();
+    // Testmodus: Belastungstest mit LEAF_STRESS=<Anzahl Aktionen>
+    if std::env::var_os("LEAF_DEBUG").is_some() {
+        if let Some(n) = std::env::var("LEAF_STRESS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            let _ = b.proxy.send_event(UserEvent::Stress(n));
+        }
+    }
 
     let mut next_tick = Instant::now() + TICK;
     event_loop.run(move |event, _, cf| {
