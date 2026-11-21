@@ -244,6 +244,8 @@ impl Default for WinState {
 pub struct Settings {
     pub adblock: bool,
     pub window: Option<WinState>,
+    /// Zoom pro Domain (nur Abweichungen von 100 %)
+    pub zoom: std::collections::HashMap<String, f64>,
 }
 
 impl Default for Settings {
@@ -251,6 +253,7 @@ impl Default for Settings {
         Settings {
             adblock: true,
             window: None,
+            zoom: Default::default(),
         }
     }
 }

@@ -17,15 +17,22 @@ Die meisten Browser schleppen Shopping-Assistenten, Sync, News-Feeds und Dutzend
 ## Funktionen
 
 - **Liquid-Glass-Design** – dunkel, grün, minimalistisch; die Oberfläche zeigt deinen Desktop-Hintergrund unscharf durch
-- **Werbe- & Tracker-Blocker** eingebaut (inkl. YouTube-Werbung überspringen), erweiterbar über eine eigene Liste
-- **Tabs** mit Favicons, per Ziehen sortierbar, Ton-Anzeige & Stummschalten
+- **Werbe- & Tracker-Blocker** mit über 3 600 Werbeservern – auch gegen YouTube- und SoundCloud-Werbung, erweiterbar über eine eigene Liste
+- **Tabs** in der Farbe der jeweiligen Website, mit Favicons, per Ziehen sortierbar, Ton-Anzeige & Stummschalten
+- **Musik & Videos laufen im Hintergrund weiter**, Tabs laden beim Zurückwechseln nicht neu
+- **Seitengröße** per Regler oben rechts (oder Strg+Mausrad) – wird pro Website gemerkt
 - **Verlauf mit Vorschlägen** direkt in der Adressleiste, Google als Suchmaschine
 - **Favoriten** auf der Startseite
 - **Sitzung wiederherstellen** – Tabs kommen nach dem Neustart zurück, du bleibst überall angemeldet
 - **Passwörter & Formulare** werden gespeichert und automatisch ausgefüllt
-- **Downloads**, Vollbild, Zoom, Suchen, Drucken
-- Eigene Fehlerseite, Sicherheits-Anzeige bei unverschlüsselten Seiten
+- **Downloads** mit Fortschritt direkt in der Leiste
+- **Popup-Fenster** für Logins (Google, Steam, Discord …), Werbe-Popups werden geblockt
+- **Externe Apps** starten: Steam-Links, CS2-Server beitreten (z. B. über xplay.gg), Discord, Spotify …
+- Vollbild, Suchen, Drucken, eigene Fehlerseite, Sicherheits-Anzeige bei unverschlüsselten Seiten
+- Stürzt die Web-Engine ab, startet Leaf sich mit allen Tabs selbst neu
 - Kann als **Standardbrowser** gesetzt werden
+
+Was sich in welcher Version geändert hat, steht im [Update-Log](CHANGELOG.md).
 
 ## Tastenkürzel
 

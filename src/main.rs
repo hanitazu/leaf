@@ -1,7 +1,8 @@
 // Leaf – ein schlanker Browser in Rust.
 // Natives Fenster (tao) + System-WebView (wry → WebView2).
-// RAM/CPU sparen: ein gemeinsamer Browser-Prozess, versteckte Tabs werden
-// eingefroren, nach 10 min ganz entladen, neue Tabs kosten gar keinen WebView.
+// RAM/CPU sparen: ein gemeinsamer Browser-Prozess, versteckte Tabs werden nach
+// 5 min eingefroren, nach 30 min entladen (nie, solange sie Ton abspielen),
+// neue Tabs kosten gar keinen WebView.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod adblock;
@@ -33,16 +34,34 @@ use wry::{
 const BAR_H: f64 = 84.0;
 const FRAME: f64 = 8.0;
 const SEARCH: &str = "https://www.google.com/search?q=";
-const DISCARD_AFTER: Duration = Duration::from_secs(10 * 60);
+const SUSPEND_AFTER: Duration = Duration::from_secs(5 * 60);
+const DISCARD_AFTER: Duration = Duration::from_secs(30 * 60);
 const TICK: Duration = Duration::from_secs(30);
 const PORT: u16 = 47291;
 const UI_HTML: &str = include_str!("ui.html");
 
+/// Hintergrunddienste aus, die nur bremsen. Bewusst kein Prozess-Limit mehr:
+/// das sparte etwas RAM, ließ bei einem Absturz aber gleich mehrere Tabs sterben.
 #[cfg(windows)]
 const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,\
-msEdgeShoppingAssistant,msEdgeCollections,Translate,OptimizationHints,MediaRouter,BackForwardCache \
+msEdgeShoppingAssistant,msEdgeCollections,Translate,OptimizationHints,MediaRouter \
 --disable-background-networking --disable-component-update --disable-domain-reliability \
---disable-sync --no-pings --process-per-site --renderer-process-limit=4";
+--disable-sync --no-pings";
+
+/// Farbe der Seite für den Tab: theme-color, sonst die kräftigste Farbe des Favicons.
+const COLOR_JS: &str = r#"(function(){if(window.top!==window)return;
+var sent='';function send(c){if(c!==sent){sent=c;window.ipc.postMessage('color:'+c);}}
+function hex(c){var x=document.createElement('canvas').getContext('2d');x.fillStyle='#000';x.fillStyle=c;var v=x.fillStyle;return /^#[0-9a-f]{6}$/i.test(v)?v:'';}
+function vivid(h){var r=parseInt(h.substr(1,2),16),g=parseInt(h.substr(3,2),16),b=parseInt(h.substr(5,2),16),mx=Math.max(r,g,b),mn=Math.min(r,g,b);return mx-mn>40&&mx>60&&mn<225;}
+function pick(img){try{var c=document.createElement('canvas');c.width=c.height=16;var x=c.getContext('2d');x.drawImage(img,0,0,16,16);
+ var d=x.getImageData(0,0,16,16).data,best=null,bs=0;for(var k=0;k<d.length;k+=4){if(d[k+3]<200)continue;var r=d[k],g=d[k+1],b=d[k+2],s=Math.max(r,g,b)-Math.min(r,g,b);if(s>bs){bs=s;best=[r,g,b];}}
+ if(best&&bs>60)send('#'+best.map(function(v){return ('0'+v.toString(16)).slice(-2);}).join(''));}catch(e){}}
+function fromIcon(){var l=document.querySelector('link[rel~="icon"]'),u;try{u=new URL(l?l.href:'/favicon.ico',location.href);}catch(e){return;}
+ if(u.origin===location.origin){var i=new Image();i.onload=function(){pick(i);};i.src=u.href;return;}
+ /* Favicon auf fremdem Server (CDN): per CORS laden, dann ist es lesbar */
+ fetch(u.href,{mode:'cors',credentials:'omit'}).then(function(r){return r.ok?r.blob():null;}).then(function(b){if(b&&window.createImageBitmap)return createImageBitmap(b);}).then(function(bm){if(bm)pick(bm);}).catch(function(){});}
+function run(){var m=document.querySelector('meta[name="theme-color"]'),c=m?hex(m.content):'';if(c&&vivid(c))send(c);else fromIcon();}
+if(document.readyState==='complete')setTimeout(run,300);else addEventListener('load',function(){setTimeout(run,300);});})();"#;
 
 /// Tastenkürzel in Webseiten → nur eine feste Liste an Befehlen erlaubt.
 const SHORTCUTS_JS: &str = r#"(function(){if(window.top!==window)return;
@@ -55,18 +74,46 @@ if(m){e.preventDefault();e.stopPropagation();window.ipc.postMessage(m);}},true);
 
 pub enum UserEvent {
     Ui(String),
-    Key(String),
+    /// Nachricht einer Webseite (Tab, Text) – nur feste Befehle erlaubt
+    Key(u32, String),
     Title(u32, String),
     Load(u32, bool, String),
     NewTab(String),
-    Download,
     Blocked(u32),
     FullScreen(u32, bool),
     Nav(u32),
     NavError(u32, String),
+    ShowError(u32, String),
     Favicon(u32, String),
     Open(String),
     CookiesSaved,
+    DlStart {
+        dl: u32,
+        tab: u32,
+        name: String,
+        total: i64,
+    },
+    DlProgress {
+        dl: u32,
+        got: i64,
+        total: i64,
+    },
+    DlDone {
+        dl: u32,
+        ok: bool,
+    },
+    Zoom(u32, f64),
+    /// Prozess abgestürzt: (Tab, war es der Browser-Prozess?)
+    Crashed(u32, bool),
+}
+
+struct Download {
+    dl: u32,
+    name: String,
+    got: i64,
+    total: i64,
+    done: Option<bool>,
+    at: Instant,
 }
 
 #[derive(Deserialize)]
@@ -102,6 +149,7 @@ enum Cmd {
     ClearData,
     ReopenTab,
     Fullscreen,
+    Zoom { z: f64 },
 }
 
 struct Tab {
@@ -116,6 +164,13 @@ struct Tab {
     blocked: u32,
     /// zeigt gerade Leafs eigene Fehlerseite
     error: bool,
+    /// Markenfarbe der Seite (#rrggbb) oder leer
+    color: String,
+    /// seit wann im Hintergrund
+    hidden_at: Option<Instant>,
+    suspended: bool,
+    /// letzter Download aus diesem Tab (dessen Navigation „scheitert“ technisch)
+    dl_at: Option<Instant>,
 }
 
 /// Eigene Fehlerseite im Leaf-Look (statt der Edge-Seite von WebView2).
@@ -168,6 +223,10 @@ impl Tab {
             last_active: Instant::now(),
             blocked: 0,
             error: false,
+            color: String::new(),
+            hidden_at: None,
+            suspended: false,
+            dl_at: None,
         }
     }
 }
@@ -187,7 +246,7 @@ struct Browser {
     saved_session: Session,
     overlay: bool,
     fullscreen: bool,
-    downloads: bool,
+    downloads: Vec<Download>,
     closed: Vec<String>,
     /// Änderungszeit des Hintergrundbilds (0 = keins) – dient auch als Cache-Buster
     wall: u64,
@@ -234,24 +293,19 @@ fn make_tab_view(
     url: &str,
     bounds: Rect,
 ) -> wry::Result<WebView> {
-    let (p1, p2, p3, p4, p5) = (
-        proxy.clone(),
-        proxy.clone(),
-        proxy.clone(),
-        proxy.clone(),
-        proxy.clone(),
-    );
+    let (p1, p2, p3) = (proxy.clone(), proxy.clone(), proxy.clone());
     let mut b = WebViewBuilder::with_web_context(ctx)
         .with_bounds(bounds)
         .with_url(url)
         .with_background_color((255, 255, 255, 255))
-        .with_initialization_script(SHORTCUTS_JS);
+        .with_initialization_script(SHORTCUTS_JS)
+        .with_initialization_script(COLOR_JS);
     if adblock::enabled() {
-        b = b.with_initialization_script(adblock::COSMETIC_JS);
+        b = b.with_initialization_script(adblock::PAGE_JS);
     }
     let b = b
         .with_ipc_handler(move |req: Request<String>| {
-            let _ = p1.send_event(UserEvent::Key(req.into_body()));
+            let _ = p1.send_event(UserEvent::Key(id, req.into_body()));
         })
         .with_document_title_changed_handler(move |t| {
             let _ = p2.send_event(UserEvent::Title(id, t));
@@ -262,25 +316,33 @@ fn make_tab_view(
                 matches!(ev, PageLoadEvent::Started),
                 url,
             ));
-        })
-        .with_new_window_req_handler(move |url| {
-            let _ = p4.send_event(UserEvent::NewTab(url));
-            false
-        })
-        .with_download_started_handler(move |_, _| {
-            let _ = p5.send_event(UserEvent::Download);
-            true // WebView2 zeigt sein natives Download-Panel mit Fortschritt
         });
+    // Neue Fenster, Downloads, externe Apps: eigene Handler in win::attach
     let view = platform(b).build_as_child(window)?;
     #[cfg(windows)]
     win::attach(&view, proxy.clone(), id);
     Ok(view)
 }
 
-fn hide(view: &WebView) {
-    let _ = view.set_visible(false);
-    #[cfg(windows)]
-    win::suspend(view);
+/// Nur ausblenden – Videos/Musik laufen weiter. Eingefroren wird erst später im tick.
+fn hide(t: &mut Tab) {
+    if let Some(v) = &t.view {
+        let _ = v.set_visible(false);
+        t.hidden_at = Some(Instant::now());
+    }
+}
+
+/// Log für Fehlersuche: nur wenn die Umgebungsvariable LEAF_DEBUG gesetzt ist.
+pub fn debug_log(msg: &str) {
+    if std::env::var_os("LEAF_DEBUG").is_some() {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(data_dir().join("debug.log"))
+        {
+            let _ = writeln!(f, "{msg}");
+        }
+    }
 }
 
 impl Browser {
@@ -414,8 +476,8 @@ impl Browser {
             return;
         }
         if idx != self.active {
-            if let Some(v) = self.tabs.get(self.active).and_then(|t| t.view.as_ref()) {
-                hide(v);
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                hide(t);
             }
         }
         self.active = idx;
@@ -423,10 +485,15 @@ impl Browser {
         if self.tabs[idx].view.is_none() && !self.tabs[idx].url.is_empty() {
             self.create_view(idx);
         }
-        self.tabs[idx].last_active = Instant::now();
-        if let Some(v) = &self.tabs[idx].view {
+        let t = &mut self.tabs[idx];
+        t.last_active = Instant::now();
+        t.hidden_at = None;
+        if let Some(v) = &t.view {
             #[cfg(windows)]
-            win::resume(v);
+            if t.suspended {
+                win::resume(v);
+            }
+            t.suspended = false;
             let _ = v.focus();
         }
         self.layout();
@@ -513,7 +580,7 @@ impl Browser {
                 #[cfg(not(windows))]
                 let (audio, muted) = (false, false);
                 json!({"id": t.id, "title": t.title, "url": t.url, "loading": t.loading,
-                       "icon": t.favicon, "audio": audio, "muted": muted})
+                       "icon": t.favicon, "audio": audio, "muted": muted, "color": t.color})
             })
             .collect();
         #[cfg(windows)]
@@ -550,7 +617,8 @@ impl Browser {
             "fwd": can_fwd,
             "adblock": adblock::enabled(),
             "blocked": self.cur().map(|t| t.blocked).unwrap_or(0),
-            "downloads": self.downloads,
+            "dl": self.download_state(),
+            "zoom": self.current_zoom(),
             "max": self.window.is_maximized(),
         });
         let _ = self.toolbar.evaluate_script(&format!("ui.update({state})"));
@@ -559,11 +627,14 @@ impl Browser {
         }
     }
 
+    /// Hintergrund-Tabs: nach 5 min einfrieren, nach 30 min entladen –
+    /// aber nie, solange sie Ton abspielen (YouTube/Musik im Hintergrund).
     fn tick(&mut self) {
         let now = Instant::now();
-        let active = self.active;
-        for (i, t) in self.tabs.iter_mut().enumerate() {
-            let Some(v) = &t.view else { continue };
+        for t in self.tabs.iter_mut() {
+            let (Some(v), Some(since)) = (&t.view, t.hidden_at) else {
+                continue;
+            };
             #[cfg(windows)]
             let audio = win::status(v).2;
             #[cfg(not(windows))]
@@ -571,20 +642,102 @@ impl Browser {
                 let _ = v;
                 false
             };
-            if i != active
-                && !t.loading
-                && !audio
-                && now.duration_since(t.last_active) > DISCARD_AFTER
-            {
+            if audio || t.loading {
+                continue;
+            }
+            let idle = now.duration_since(since);
+            if idle > DISCARD_AFTER {
                 t.view = None;
+                t.suspended = false;
+            } else if idle > SUSPEND_AFTER && !t.suspended {
+                #[cfg(windows)]
+                win::suspend(v);
+                t.suspended = true;
             }
         }
+        self.downloads
+            .retain(|d| d.done.is_none() || d.at.elapsed() < Duration::from_secs(600));
         self.history.flush();
         self.persist();
         // alle 5 min Session-Cookies sichern (falls Windows hart herunterfährt)
         self.ticks += 1;
         if self.ticks.is_multiple_of(10) {
             self.save_cookies();
+        }
+    }
+
+    /// Für die Leiste: null = noch nie etwas geladen, sonst aktiver bzw. letzter Download
+    fn download_state(&self) -> serde_json::Value {
+        let Some(last) = self.downloads.last() else {
+            return serde_json::Value::Null;
+        };
+        let running: Vec<&Download> = self.downloads.iter().filter(|d| d.done.is_none()).collect();
+        let shown = running.first().copied().unwrap_or(last);
+        let pct = if shown.total > 0 {
+            (shown.got * 100 / shown.total).clamp(0, 100)
+        } else {
+            -1
+        };
+        json!({
+            "running": running.len(),
+            "name": shown.name,
+            "pct": pct,
+            "done": shown.done,
+            "fresh": shown.at.elapsed() < Duration::from_secs(4),
+        })
+    }
+
+    fn current_zoom(&self) -> f64 {
+        #[cfg(windows)]
+        if let Some(v) = self.view() {
+            return (win::zoom(v) * 100.0).round() / 100.0;
+        }
+        1.0
+    }
+
+    /// Gespeicherten Zoom einer Seite (pro Domain, wie in Chrome) anwenden.
+    fn apply_zoom(&self, idx: usize) {
+        let Some(t) = self.tabs.get(idx) else { return };
+        let Some(v) = &t.view else { return };
+        let z = self
+            .settings
+            .zoom
+            .get(host_of(&t.url))
+            .copied()
+            .unwrap_or(1.0);
+        #[cfg(windows)]
+        if (win::zoom(v) - z).abs() > 0.001 {
+            let _ = v.zoom(z);
+        }
+        #[cfg(not(windows))]
+        let _ = (v, z);
+    }
+
+    /// Farbe einer Seite übernehmen – nur gültige #rrggbb-Werte.
+    fn set_color(&mut self, id: u32, c: &str) {
+        let valid =
+            c.len() == 7 && c.starts_with('#') && c[1..].bytes().all(|b| b.is_ascii_hexdigit());
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+            let c = if valid {
+                c.to_ascii_lowercase()
+            } else {
+                String::new()
+            };
+            if t.color != c {
+                t.color = c;
+                self.sync();
+            }
+        }
+    }
+
+    /// Alles speichern und Leaf neu starten (nach einem Absturz der Web-Engine).
+    fn restart(&mut self) {
+        self.save_window();
+        self.persist();
+        self.history.flush();
+        QUITTING.store(true, Ordering::Relaxed);
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe).arg(RESTART_ARG).spawn();
         }
     }
 
@@ -704,8 +857,30 @@ impl Browser {
                     self.activate(idx);
                 }
             }
-            Cmd::NextTab => self.activate((self.active + 1) % self.tabs.len()),
-            Cmd::PrevTab => self.activate((self.active + self.tabs.len() - 1) % self.tabs.len()),
+            // (ohne Tabs würde % durch 0 teilen → Absturz)
+            Cmd::NextTab if !self.tabs.is_empty() => {
+                self.activate(self.active.wrapping_add(1) % self.tabs.len())
+            }
+            Cmd::PrevTab if !self.tabs.is_empty() => {
+                let n = self.tabs.len();
+                self.activate((self.active.min(n - 1) + n - 1) % n)
+            }
+            Cmd::NextTab | Cmd::PrevTab => {}
+            Cmd::Zoom { z } => {
+                let z = z.clamp(0.25, 5.0);
+                if let Some(t) = self.cur() {
+                    let host = host_of(&t.url).to_string();
+                    if let Some(v) = &t.view {
+                        let _ = v.zoom(z);
+                    }
+                    if (z - 1.0).abs() < 0.001 {
+                        self.settings.zoom.remove(&host);
+                    } else if !host.is_empty() {
+                        self.settings.zoom.insert(host, z);
+                    }
+                    store::save_settings(&self.dir, &self.settings);
+                }
+            }
             Cmd::Mute { id } => {
                 #[cfg(windows)]
                 if let Some(v) = self
@@ -844,7 +1019,7 @@ impl Browser {
                 Ok(cmd) => return self.run_cmd(cmd),
                 Err(e) => eprintln!("UI-Befehl ungültig: {e}"),
             },
-            UserEvent::Key(k) => {
+            UserEvent::Key(id, k) => {
                 let cmd = match k.as_str() {
                     "new_tab" => Cmd::NewTab,
                     "close_tab" => Cmd::CloseTab { id: None },
@@ -860,6 +1035,10 @@ impl Browser {
                         Ok(i) => Cmd::TabIndex { i },
                         Err(_) => return true,
                     },
+                    k if k.starts_with("color:") => {
+                        self.set_color(id, &k[6..]);
+                        return true;
+                    }
                     _ => return true,
                 };
                 return self.run_cmd(cmd);
@@ -888,8 +1067,16 @@ impl Browser {
                         self.history.visit(&url);
                         self.history.set_title(&url, &t.title);
                     }
-                    if url != "about:blank" {
+                    if !url.is_empty() && url != "about:blank" {
+                        if host_of(&t.url) != host_of(&url) {
+                            t.color.clear(); // neue Seite → neue Farbe
+                        }
                         t.url = url;
+                    }
+                }
+                if !started {
+                    if let Some(i) = self.tabs.iter().position(|t| t.id == id) {
+                        self.apply_zoom(i);
                     }
                 }
                 self.sync();
@@ -909,9 +1096,37 @@ impl Browser {
                     self.set_fullscreen(on);
                 }
             }
-            UserEvent::Nav(_) => self.sync(),
+            UserEvent::Nav(id) => {
+                #[cfg(windows)]
+                if let Some(v) = self
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == id)
+                    .and_then(|t| t.view.as_ref())
+                {
+                    debug_log(&format!("tab {id} audio={}", win::status(v).2));
+                }
+                let _ = id;
+                self.sync();
+            }
             UserEvent::NavError(id, msg) => {
+                // Ein Download-Link „scheitert“ als Navigation, und das meldet die Engine
+                // noch vor dem Download-Start. Darum kurz warten, ob ein Download folgt.
+                let p = self.proxy.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(700));
+                    let _ = p.send_event(UserEvent::ShowError(id, msg));
+                });
+            }
+            UserEvent::ShowError(id, msg) => {
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+                    // Download gestartet oder schon die nächste Seite unterwegs → keine Fehlerseite
+                    if t.loading
+                        || t.dl_at
+                            .is_some_and(|at| at.elapsed() < Duration::from_secs(10))
+                    {
+                        return true;
+                    }
                     t.error = true;
                     t.loading = false;
                     t.favicon.clear();
@@ -931,8 +1146,76 @@ impl Browser {
                 }
                 self.sync();
             }
-            UserEvent::Download => {
-                self.downloads = true;
+            UserEvent::DlStart {
+                dl,
+                tab,
+                name,
+                total,
+            } => {
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    t.dl_at = Some(Instant::now());
+                    t.loading = false;
+                }
+                self.downloads.push(Download {
+                    dl,
+                    name,
+                    got: 0,
+                    total,
+                    done: None,
+                    at: Instant::now(),
+                });
+                self.sync();
+            }
+            UserEvent::DlProgress { dl, got, total } => {
+                if let Some(d) = self.downloads.iter_mut().find(|d| d.dl == dl) {
+                    d.got = got;
+                    d.total = total;
+                }
+                self.sync();
+            }
+            UserEvent::DlDone { dl, ok } => {
+                if let Some(d) = self.downloads.iter_mut().find(|d| d.dl == dl) {
+                    d.done = Some(ok);
+                    if ok {
+                        d.got = d.total.max(d.got);
+                    }
+                    d.at = Instant::now();
+                }
+                self.sync();
+            }
+            UserEvent::Zoom(id, z) => {
+                // Strg+Mausrad: merken wie über den Regler. Während des Ladens nicht –
+                // da meldet die Engine ihren Startwert 100 %, der sonst die Einstellung löscht.
+                if self.cur().is_some_and(|t| t.id == id && !t.loading) {
+                    if let Some(host) = self.cur().map(|t| host_of(&t.url).to_string()) {
+                        if (z - 1.0).abs() < 0.001 {
+                            self.settings.zoom.remove(&host);
+                        } else if !host.is_empty() {
+                            self.settings.zoom.insert(host, z);
+                        }
+                        store::save_settings(&self.dir, &self.settings);
+                    }
+                    self.sync();
+                }
+            }
+            UserEvent::Crashed(id, browser) => {
+                if browser {
+                    // Ganze Engine weg (alle Tabs + Leiste) → sauber neu starten;
+                    // die Sitzung ist gespeichert, Tabs kommen sofort zurück.
+                    self.restart();
+                    return false;
+                }
+                let active = self.cur().map(|t| t.id) == Some(id);
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+                    if active {
+                        #[cfg(windows)]
+                        if let Some(v) = &t.view {
+                            win::reload(v);
+                        }
+                    } else {
+                        t.view = None; // lädt beim nächsten Anklicken neu
+                    }
+                }
                 self.sync();
             }
             UserEvent::CookiesSaved => {}
@@ -947,7 +1230,9 @@ impl Browser {
                     (false, false) => self.new_tab(&fix_url(u)),
                 }
                 self.window.set_minimized(false);
-                self.window.set_focus();
+                if std::env::var_os("LEAF_DEBUG").is_none() {
+                    self.window.set_focus();
+                }
             }
         }
         true
@@ -1024,16 +1309,54 @@ mod tests {
         ));
         assert!(!adblock::is_blocked("https://www.youtube.com/watch?v=1"));
         assert!(!adblock::is_blocked("https://notdoubleclick.net/"));
+        // Pfad-Regeln: nur Werbe-Pfade, nicht die ganze Seite
+        assert!(adblock::is_blocked(
+            "https://www.youtube.com/pagead/viewthroughconversion/1"
+        ));
+        assert!(adblock::is_blocked(
+            "https://www.youtube.com/api/stats/ads?ver=2"
+        ));
+        assert!(!adblock::is_blocked(
+            "https://www.youtube.com/api/stats/watchtime"
+        ));
+        assert!(!adblock::is_blocked("https://notyoutube.com/pagead/x"));
+        // SoundCloud-Audiowerbung läuft über AdsWizz
+        assert!(adblock::is_blocked(
+            "https://synchrobox.adswizz.com/register2.php"
+        ));
+        assert!(!adblock::is_blocked("https://soundcloud.com/discover"));
+        assert!(!adblock::is_blocked("https://i1.sndcdn.com/a.jpg"));
+        assert!(adblock::filters().len() > 3000);
         adblock::set_enabled(false);
         assert!(!adblock::is_blocked("https://doubleclick.net/"));
     }
+
+    #[test]
+    fn hosts() {
+        assert_eq!(host_of("https://www.youtube.com/watch?v=1"), "youtube.com");
+        assert_eq!(host_of("http://localhost:3000/x"), "localhost");
+        assert_eq!(host_of(""), "");
+    }
+}
+
+const RESTART_ARG: &str = "--restart";
+
+/// Host einer URL ohne "www." (für Zoom pro Seite, Tab-Farbe)
+fn host_of(url: &str) -> &str {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or("");
+    let host = rest.split(['/', '?', '#', ':']).next().unwrap_or("");
+    host.strip_prefix("www.").unwrap_or(host)
 }
 
 fn data_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let d = base.join("Leaf");
+    // LEAF_PROFILE=<Name> nutzt ein getrenntes Profil (zum Testen, ohne echte Daten)
+    let d = match std::env::var("LEAF_PROFILE") {
+        Ok(p) if !p.is_empty() => base.join(format!("Leaf-{p}")),
+        _ => base.join("Leaf"),
+    };
     let _ = std::fs::create_dir_all(&d);
     d
 }
@@ -1072,12 +1395,31 @@ fn listen(proxy: EventLoopProxy<UserEvent>) {
 }
 
 fn main() -> wry::Result<()> {
-    let arg = std::env::args().nth(1).unwrap_or_default();
-    if hand_off(&arg) {
+    let mut arg = std::env::args().nth(1).unwrap_or_default();
+    if arg == RESTART_ARG {
+        // Neustart nach Absturz: der alte Prozess gibt gerade noch Port & Profil frei
+        std::thread::sleep(Duration::from_millis(1500));
+        arg.clear();
+    } else if hand_off(&arg) {
         return Ok(());
     }
 
     let dir = data_dir();
+    // Falls doch einmal etwas schiefgeht: Ursache festhalten statt still zu verschwinden
+    let log = dir.join("crash.log");
+    std::panic::set_hook(Box::new(move |info| {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+        {
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(f, "[{t}] {info}");
+        }
+    }));
     let settings = store::load_settings(&dir);
     adblock::init(&dir, settings.adblock);
 
@@ -1150,7 +1492,7 @@ fn main() -> wry::Result<()> {
         saved_session: Session::default(),
         overlay: false,
         fullscreen: false,
-        downloads: false,
+        downloads: Vec::new(),
         closed: Vec::new(),
         wall: wall_stamp(),
         quitting: None,

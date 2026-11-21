@@ -18,17 +18,23 @@ jobs:
           rustup toolchain install stable --profile minimal
           cargo build --release --locked
 
+      - name: Release-Notizen aus CHANGELOG.md
+        shell: bash
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          awk -v v="## $v" '$0==v{on=1;next} /^## /{on=0} on' CHANGELOG.md > notes.md
+          cat >> notes.md <<'EOF'
+
+          ---
+          **Download:** `leaf.exe` unten herunterladen und starten – keine Installation nötig.
+          Als Standardbrowser einrichten: Repo herunterladen, `leaf.exe` in den Ordner legen und `install.ps1` ausführen.
+
+          Voraussetzung: Windows 10/11 (WebView2 ist vorinstalliert). Die Datei ist nicht signiert – falls Windows SmartScreen warnt: „Weitere Informationen“ → „Trotzdem ausführen“.
+          EOF
+
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
+          name: Leaf ${{ github.ref_name }}
           files: target/release/leaf.exe
-          body: |
-            ## Leaf ${{ github.ref_name }}
-
-            **Download:** `leaf.exe` unten herunterladen und starten – keine Installation nötig.
-
-            Optional als Standardbrowser einrichten: Repo herunterladen, `leaf.exe` in den Ordner legen und `install.ps1` ausführen.
-
-            Voraussetzung: Windows 10/11 (WebView2 ist vorinstalliert).
-
-            Hinweis: Die Datei ist nicht signiert. Falls Windows SmartScreen warnt: „Weitere Informationen“ → „Trotzdem ausführen“.
+          body_path: notes.md

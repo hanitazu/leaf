@@ -1,12 +1,17 @@
-//! Windows-spezifisch: Acrylic-Glas, runde Ecken, Werbeblocker-Hook,
-//! Navigation, Ton, Favicons, Tab-Pausierung – direkt über die WebView2-COM-API.
+//! Windows-spezifisch über die WebView2-COM-API: Werbeblocker-Hook, Navigation,
+//! Popups, Downloads, externe Apps, Zoom, Ton, Favicons, Tab-Pausierung,
+//! Absturz-Erkennung, Session-Cookies – dazu Fenster-Stil und Hintergrundbild.
 use crate::UserEvent;
+use std::sync::atomic::Ordering;
 use tao::event_loop::EventLoopProxy;
 use webview2_com::{
-    take_pwstr, ClearBrowsingDataCompletedHandler, ContainsFullScreenElementChangedEventHandler,
+    take_pwstr, BytesReceivedChangedEventHandler, ClearBrowsingDataCompletedHandler,
+    ContainsFullScreenElementChangedEventHandler, DownloadStartingEventHandler,
     FaviconChangedEventHandler, GetCookiesCompletedHandler, HistoryChangedEventHandler,
-    IsDocumentPlayingAudioChangedEventHandler, Microsoft::Web::WebView2::Win32::*,
-    NavigationCompletedEventHandler, TrySuspendCompletedHandler, WebResourceRequestedEventHandler,
+    IsDocumentPlayingAudioChangedEventHandler, LaunchingExternalUriSchemeEventHandler,
+    Microsoft::Web::WebView2::Win32::*, NavigationCompletedEventHandler,
+    NewWindowRequestedEventHandler, ProcessFailedEventHandler, StateChangedEventHandler,
+    TrySuspendCompletedHandler, WebResourceRequestedEventHandler, ZoomFactorChangedEventHandler,
 };
 use windows::{
     core::{w, Interface, PWSTR},
@@ -86,13 +91,29 @@ pub fn attach(view: &WebView, proxy: EventLoopProxy<UserEvent>, id: u32) {
                 let _ = s4.SetIsGeneralAutofillEnabled(true);
             }
         }
+        // Testmodus: Seiten stumm, damit beim Testen nichts aus den Lautsprechern kommt
+        if std::env::var_os("LEAF_DEBUG").is_some() {
+            if let Ok(w8) = wv.cast::<ICoreWebView2_8>() {
+                let _ = w8.SetIsMuted(true);
+            }
+        }
 
         if let Ok(env) = wv.cast::<ICoreWebView2_2>().and_then(|w| w.Environment()) {
             let p = proxy.clone();
-            if wv
-                .AddWebResourceRequestedFilter(w!("*"), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)
-                .is_ok()
-            {
+            // Nur Anfragen an bekannte Werbe-Hosts werden gemeldet; alles andere lädt
+            // ohne Umweg über Leaf (früher lief jede Anfrage durch den UI-Thread).
+            let started = std::time::Instant::now();
+            let mut any = false;
+            for f in crate::adblock::filters() {
+                any |= wv
+                    .AddWebResourceRequestedFilter(
+                        &windows::core::HSTRING::from(f),
+                        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                    )
+                    .is_ok();
+            }
+            crate::debug_log(&format!("adblock filters: {:?}", started.elapsed()));
+            if any {
                 let _ = wv.add_WebResourceRequested(
                     &WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
                         let Some(args) = args else { return Ok(()) };
@@ -133,10 +154,19 @@ pub fn attach(view: &WebView, proxy: EventLoopProxy<UserEvent>, id: u32) {
                 if ok.as_bool() {
                     return Ok(());
                 }
+                // Hat der Server geantwortet (auch 403/404/500), zeigt die Seite ihren
+                // eigenen Inhalt – keine Leaf-Fehlerseite darüberlegen.
+                if let Ok(a2) = args.cast::<ICoreWebView2NavigationCompletedEventArgs2>() {
+                    let mut code = 0i32;
+                    if a2.HttpStatusCode(&mut code).is_ok() && code > 0 {
+                        return Ok(());
+                    }
+                }
                 let mut st = COREWEBVIEW2_WEB_ERROR_STATUS::default();
                 args.WebErrorStatus(&mut st)?;
+                // Nur echte Netzwerkfehler – abgebrochene Navigationen, Downloads,
+                // Weiterleitungen usw. (Status UNKNOWN) bleiben unangetastet.
                 let msg = match st {
-                    COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED => return Ok(()),
                     COREWEBVIEW2_WEB_ERROR_STATUS_HOST_NAME_NOT_RESOLVED => "Diese Adresse gibt es nicht – vielleicht ein Tippfehler?",
                     COREWEBVIEW2_WEB_ERROR_STATUS_DISCONNECTED => "Keine Internetverbindung.",
                     COREWEBVIEW2_WEB_ERROR_STATUS_TIMEOUT => "Die Seite antwortet nicht (Zeitüberschreitung).",
@@ -145,7 +175,7 @@ pub fn attach(view: &WebView, proxy: EventLoopProxy<UserEvent>, id: u32) {
                     | COREWEBVIEW2_WEB_ERROR_STATUS_CONNECTION_RESET
                     | COREWEBVIEW2_WEB_ERROR_STATUS_CONNECTION_ABORTED => "Der Server ist gerade nicht erreichbar.",
                     s if (1..=5).contains(&s.0) => "Das Sicherheitszertifikat dieser Seite ist ungültig – Leaf hat sie zu deinem Schutz blockiert.",
-                    _ => "Die Seite konnte nicht geladen werden.",
+                    _ => return Ok(()),
                 };
                 let _ = p.send_event(UserEvent::NavError(id, msg.into()));
                 Ok(())
@@ -193,7 +223,220 @@ pub fn attach(view: &WebView, proxy: EventLoopProxy<UserEvent>, id: u32) {
                 COREWEBVIEW2_DEFAULT_DOWNLOAD_DIALOG_CORNER_ALIGNMENT_TOP_RIGHT,
             );
         }
+
+        // Neue Fenster: echte Popups (Login mit Google/Steam/Discord …) bekommen ein
+        // eigenes Fenster, damit window.opener funktioniert. Normale Links mit
+        // target=_blank öffnen einen Tab. Ungefragte Popups (Werbung) werden geblockt.
+        let p = proxy.clone();
+        let _ = wv.add_NewWindowRequested(
+            &NewWindowRequestedEventHandler::create(Box::new(move |_, args| {
+                let Some(args) = args else { return Ok(()) };
+                let mut user = BOOL::default();
+                args.IsUserInitiated(&mut user)?;
+                if !user.as_bool() && crate::adblock::enabled() {
+                    return args.SetHandled(true);
+                }
+                let mut sized = BOOL::default();
+                if let Ok(f) = args.WindowFeatures() {
+                    let _ = f.HasSize(&mut sized);
+                }
+                if sized.as_bool() {
+                    return Ok(()); // WebView2 öffnet ein Popup-Fenster mit Opener
+                }
+                let mut uri = PWSTR::null();
+                args.Uri(&mut uri)?;
+                args.SetHandled(true)?;
+                let _ = p.send_event(UserEvent::NewTab(take_pwstr(uri)));
+                Ok(())
+            })),
+            &mut token,
+        );
+
+        // Downloads: Fortschritt an die Leiste melden und das Download-Panel öffnen.
+        if let Ok(w4) = wv.cast::<ICoreWebView2_4>() {
+            let p = proxy.clone();
+            let _ = w4.add_DownloadStarting(
+                &DownloadStartingEventHandler::create(Box::new(move |sender, args| {
+                    let Some(args) = args else { return Ok(()) };
+                    let op = args.DownloadOperation()?;
+                    let mut path = PWSTR::null();
+                    args.ResultFilePath(&mut path)?;
+                    let path = take_pwstr(path);
+                    let name = std::path::Path::new(&path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Download".into());
+                    let mut total = 0i64;
+                    let _ = op.TotalBytesToReceive(&mut total);
+                    let dl = NEXT_DOWNLOAD.fetch_add(1, Ordering::Relaxed);
+                    let _ = p.send_event(UserEvent::DlStart {
+                        dl,
+                        tab: id,
+                        name,
+                        total,
+                    });
+                    let mut tok = EventRegistrationToken::default();
+                    let p2 = p.clone();
+                    let mut last = (std::time::Instant::now(), -1i64);
+                    let _ = op.add_BytesReceivedChanged(
+                        &BytesReceivedChangedEventHandler::create(Box::new(move |op, _| {
+                            if let Some(op) = op {
+                                let (mut got, mut total) = (0i64, 0i64);
+                                op.BytesReceived(&mut got)?;
+                                let _ = op.TotalBytesToReceive(&mut total);
+                                let pct = if total > 0 { got * 100 / total } else { -1 };
+                                if pct != last.1 && last.0.elapsed().as_millis() > 250 {
+                                    last = (std::time::Instant::now(), pct);
+                                    let _ = p2.send_event(UserEvent::DlProgress { dl, got, total });
+                                }
+                            }
+                            Ok(())
+                        })),
+                        &mut tok,
+                    );
+                    let p3 = p.clone();
+                    let _ = op.add_StateChanged(
+                        &StateChangedEventHandler::create(Box::new(move |op, _| {
+                            if let Some(op) = op {
+                                let mut st = COREWEBVIEW2_DOWNLOAD_STATE::default();
+                                op.State(&mut st)?;
+                                if st != COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS {
+                                    let ok = st == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED;
+                                    let _ = p3.send_event(UserEvent::DlDone { dl, ok });
+                                }
+                            }
+                            Ok(())
+                        })),
+                        &mut tok,
+                    );
+                    if let Some(w9) = sender.and_then(|s| s.cast::<ICoreWebView2_9>().ok()) {
+                        let _ = w9.OpenDefaultDownloadDialog();
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            );
+        }
+
+        // Externe Apps: steam://, discord:// usw. direkt öffnen (z. B. CS2-Server über
+        // xplay.gg beitreten, Spiele starten). Andere Schemata fragen wie gewohnt nach.
+        if let Ok(w18) = wv.cast::<ICoreWebView2_18>() {
+            let _ = w18.add_LaunchingExternalUriScheme(
+                &LaunchingExternalUriSchemeEventHandler::create(Box::new(move |_, args| {
+                    let Some(args) = args else { return Ok(()) };
+                    let mut uri = PWSTR::null();
+                    args.Uri(&mut uri)?;
+                    let uri = take_pwstr(uri);
+                    if trusted_app_scheme(&uri) {
+                        args.SetCancel(true)?;
+                        open_external(&uri);
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            );
+        }
+
+        // Zoom (Strg+Mausrad) an die Leiste melden
+        let p = proxy.clone();
+        let _ = view.controller().add_ZoomFactorChanged(
+            &ZoomFactorChangedEventHandler::create(Box::new(move |c, _| {
+                if let Some(c) = c {
+                    let mut z = 1.0f64;
+                    c.ZoomFactor(&mut z)?;
+                    let _ = p.send_event(UserEvent::Zoom(id, z));
+                }
+                Ok(())
+            })),
+            &mut token,
+        );
+
+        // Abgestürzte Seiten-/Browser-Prozesse erkennen statt hängen zu bleiben
+        let p = proxy.clone();
+        let _ = wv.add_ProcessFailed(
+            &ProcessFailedEventHandler::create(Box::new(move |_, args| {
+                let Some(args) = args else { return Ok(()) };
+                let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+                args.ProcessFailedKind(&mut kind)?;
+                let browser = kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED;
+                if browser
+                    || kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED
+                    || kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE
+                {
+                    let _ = p.send_event(UserEvent::Crashed(id, browser));
+                }
+                Ok(())
+            })),
+            &mut token,
+        );
     }
+}
+
+static NEXT_DOWNLOAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// Schemata, die ohne Rückfrage an die zugehörige App gehen dürfen.
+fn trusted_app_scheme(uri: &str) -> bool {
+    const OK: &[&str] = &[
+        "steam",
+        "discord",
+        "spotify",
+        "com.epicgames.launcher",
+        "battlenet",
+        "uplay",
+        "origin",
+        "origin2",
+        "eadesktop",
+        "roblox-player",
+        "roblox",
+        "zoommtg",
+        "msteams",
+        "slack",
+        "tg",
+        "whatsapp",
+        "mailto",
+        "tel",
+        "riotclient",
+        "goggalaxy",
+        "obsidian",
+    ];
+    uri.split_once(':')
+        .is_some_and(|(s, _)| OK.contains(&s.to_ascii_lowercase().as_str()))
+}
+
+fn open_external(uri: &str) {
+    use windows::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+    unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            &windows::core::HSTRING::from(uri),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn app_schemes() {
+        assert!(super::trusted_app_scheme("steam://connect/1.2.3.4:27015"));
+        assert!(super::trusted_app_scheme("steam://run/730"));
+        assert!(super::trusted_app_scheme("Discord://-/channels/1"));
+        assert!(!super::trusted_app_scheme("ms-msdt:/id PCWDiagnostic"));
+        assert!(!super::trusted_app_scheme("search-ms:query=x"));
+        assert!(!super::trusted_app_scheme("file:///C:/x.exe"));
+    }
+}
+
+/// Zoom der Seite (1.0 = 100 %)
+pub fn zoom(view: &WebView) -> f64 {
+    let mut z = 1.0;
+    unsafe {
+        let _ = view.controller().ZoomFactor(&mut z);
+    }
+    z
 }
 
 pub fn back(view: &WebView) {
